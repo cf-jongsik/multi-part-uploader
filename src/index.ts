@@ -1,65 +1,158 @@
-import { DurableObject } from "cloudflare:workers";
+import { Hono, Context } from 'hono';
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.toml`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+const app = new Hono<{ Bindings: Env }>();
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
+app.post('/:key', async (c: Context<{ Bindings: Env }>) => {
+	const action = c.req.query('action');
+	if (!action) {
+		return c.text('Missing action query parameter', {
+			status: 400,
+		});
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
+	switch (action) {
+		case 'mpu-create': {
+			const multipartUpload = await c.env.r2.createMultipartUpload(c.req.param('key'));
+			return c.json({
+				key: multipartUpload.key,
+				uploadId: multipartUpload.uploadId,
+			});
+			break;
+		}
+		case 'mpu-complete': {
+			const uploadId = c.req.query('uploadId');
+			if (!uploadId) {
+				return c.text('Missing uploadId', { status: 400 });
+			}
+
+			const multipartUpload = c.env.r2.resumeMultipartUpload(c.req.param('key'), uploadId);
+			interface completeBody {
+				parts: R2UploadedPart[];
+			}
+			const completeBody: completeBody = await c.req.json();
+			if (!completeBody) {
+				return c.text('Missing or incomplete body', {
+					status: 400,
+				});
+			}
+
+			// Error handling in case the multipart upload does not exist anymore
+			try {
+				const object = await multipartUpload.complete(completeBody.parts);
+				return c.json(null, {
+					headers: {
+						etag: object.httpEtag,
+					},
+				});
+			} catch (error: any) {
+				console.log(error);
+				return c.json(error, { status: 400 });
+			}
+			break;
+		}
+		default:
+			return c.text(`Unknown action ${action} for POST`, {
+				status: 400,
+			});
 	}
-}
+});
 
-export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// We will create a `DurableObjectId` using the pathname from the Worker request
-		// This id refers to a unique instance of our 'MyDurableObject' class above
-		let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(new URL(request.url).pathname);
+app.get('/:key', async (c: Context<{ Bindings: Env }>) => {
+	const action = c.req.query('action');
+	if (!action) {
+		return c.text('Missing action query parameter', {
+			status: 400,
+		});
+	}
+	if (action !== 'get') {
+		return c.text(`Unknown action ${action} for GET`, {
+			status: 400,
+		});
+	}
+	const object = await c.env.r2.get(c.req.param('key'));
+	if (!object) {
+		return c.text('Object Not Found', { status: 404 });
+	}
+	const headers = new Headers();
+	object.writeHttpMetadata(headers);
+	headers.set('etag', object.httpEtag);
+	return c.newResponse(object.body, { headers });
+});
 
-		// This stub creates a communication channel with the Durable Object instance
-		// The Durable Object constructor will be invoked upon the first call for a given id
-		let stub = env.MY_DURABLE_OBJECT.get(id);
+app.put('/:key', async (c: Context<{ Bindings: Env }>) => {
+	const action = c.req.query('action');
+	if (!action) {
+		return c.text('Missing action query parameter', {
+			status: 400,
+		});
+	}
+	switch (action) {
+		case 'mpu-uploadpart': {
+			const uploadId = c.req.query('uploadId');
+			const partNumberString = c.req.query('partNumber');
+			if (!partNumberString || !uploadId) {
+				return c.text('Missing partNumber or uploadId', {
+					status: 400,
+				});
+			}
+			if (!c.req.raw.body) {
+				return c.text('Missing request body', { status: 400 });
+			}
 
-		// We call the `sayHello()` RPC method on the stub to invoke the method on the remote
-		// Durable Object instance
-		let greeting = await stub.sayHello("world");
+			const partNumber = parseInt(partNumberString);
+			const multipartUpload = c.env.r2.resumeMultipartUpload(c.req.param('key'), uploadId);
+			try {
+				const uploadedPart: R2UploadedPart = await multipartUpload.uploadPart(partNumber, c.req.raw.body);
+				return c.json(uploadedPart);
+			} catch (error: any) {
+				return c.text(error.message, { status: 400 });
+			}
+		}
+		default:
+			return c.text(`Unknown action ${action} for PUT`, {
+				status: 400,
+			});
+	}
+});
 
-		return new Response(greeting);
-	},
-} satisfies ExportedHandler<Env>;
+app.delete('/:key', async (c: Context<{ Bindings: Env }>) => {
+	const action = c.req.query('action');
+	if (!action) {
+		return c.text('Missing action query parameter', {
+			status: 400,
+		});
+	}
+	switch (action) {
+		case 'mpu-abort': {
+			const uploadId = c.req.query('uploadId');
+			if (!uploadId) {
+				return c.text('Missing uploadId', { status: 400 });
+			}
+			const multipartUpload = c.env.r2.resumeMultipartUpload(c.req.param('key'), uploadId);
+
+			try {
+				multipartUpload.abort();
+			} catch (error: any) {
+				return c.text(error.message, { status: 400 });
+			}
+			return c.text(uploadId, { status: 204 });
+		}
+		case 'delete': {
+			await c.env.r2.delete(c.req.param('key'));
+			return c.text(c.req.param('key'), { status: 204 });
+		}
+		default:
+			return c.text(`Unknown action ${action} for DELETE`, {
+				status: 400,
+			});
+	}
+});
+
+app.onError((err, c: Context<{ Bindings: Env }>) => {
+	return c.text('Method Not Allowed', {
+		status: 405,
+		headers: { Allow: 'PUT, POST, GET, DELETE' },
+	});
+});
+
+export default app;
